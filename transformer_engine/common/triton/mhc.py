@@ -47,14 +47,21 @@ def projection_prune_fwd(configs, named_args, **kwargs):
         # Deterministic path: a single K block covers the whole reduction, so each program
         # stores its result instead of atomic-adding across split-K blocks.
         K = named_args.get("K", kwargs.get("K", None))
-        block_m = [16, 64, 128]
         block_k = align_to(K, 32)
-        step_k = [256]
-        warps = [2, 8]
+        # Each thread holds a share of the (BLOCK_SIZE_M, STEP_SIZE_K) tile. With fp32 operands,
+        # STEP_SIZE_K=256 or 2 warps spills it to local memory (up to ~70 KB per thread), and
+        # launching such a config can fail with CUDA_ERROR_OUT_OF_MEMORY when device memory is
+        # tight. STEP_SIZE_K=32 with 8 warps does not spill and is also faster for small M.
+        tiles = list(itertools.product([16, 32, 64, 128], [32], [8]))
+        x = named_args.get("x_ptr", kwargs.get("x_ptr", None))
+        phi = named_args.get("phi_ptr", kwargs.get("phi_ptr", None))
+        if x.element_size() == 2 and phi.element_size() == 2:
+            # 16-bit operands do not spill with the larger step, which is faster for large M.
+            tiles += list(itertools.product([16, 64, 128], [256], [2, 8]))
         stages = [2, 3, 4]
 
         pruned_configs = []
-        for bm, sk, w, s in itertools.product(block_m, step_k, warps, stages):
+        for (bm, sk, w), s in itertools.product(tiles, stages):
             pruned_configs.append(
                 triton.Config(
                     {
