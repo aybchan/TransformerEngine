@@ -154,6 +154,110 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_topk_with_score_function_fw
   return std::make_tuple(probs, routing_map, intermediate_output);
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+fused_topk_with_score_function_qb_fwd(at::Tensor logits, int topk,
+                                      std::optional<float> scaling_factor, at::Tensor expert_bias,
+                                      int routing_map_format,
+                                      std::optional<at::Tensor> topk_indices, at::Tensor histogram,
+                                      at::Tensor bin_bounds, int histogram_mode) {
+  check_routing_map_format(routing_map_format);
+  TORCH_CHECK(logits.dim() >= 1, "logits must have at least 1 dim");
+  TORCH_CHECK(logits.is_cuda() && logits.is_contiguous(),
+              "logits must be a contiguous CUDA tensor");
+  at::cuda::CUDAGuard device_guard(logits.device());
+  const auto sizes = logits.sizes();
+  const int64_t num_experts = sizes.back();
+  const int64_t num_tokens =
+      std::accumulate(sizes.begin(), sizes.end() - 1, int64_t{1}, std::multiplies<int64_t>());
+  TORCH_CHECK(num_tokens > 0 && num_experts > 0,
+              "num_tokens and num_experts must be greater than 0");
+  TORCH_CHECK(topk > 0 && topk < num_experts,
+              "QB topk must be in [1, num_experts), got topk=", topk, " num_experts=", num_experts);
+  TORCH_CHECK(expert_bias.is_cuda() && expert_bias.is_contiguous(),
+              "QB expert_bias must be a contiguous CUDA tensor");
+  TORCH_CHECK(expert_bias.device() == logits.device(),
+              "QB expert_bias must be on the logits device");
+  TORCH_CHECK(expert_bias.scalar_type() == at::kFloat, "QB expert_bias must have float32 dtype");
+  TORCH_CHECK(expert_bias.dim() == 1 && expert_bias.numel() == num_experts,
+              "QB expert_bias must have shape [num_experts]");
+  TORCH_CHECK(histogram.is_cuda() && histogram.is_contiguous(),
+              "QB histogram must be a contiguous CUDA tensor");
+  TORCH_CHECK(histogram.device() == logits.device(), "QB histogram must be on the logits device");
+  TORCH_CHECK(histogram.scalar_type() == at::kInt, "QB histogram must have int32 dtype");
+  TORCH_CHECK(histogram.dim() == 2 && histogram.size(0) == num_experts && histogram.size(1) > 0,
+              "QB histogram must have shape [num_experts, num_bins]");
+  TORCH_CHECK(bin_bounds.is_cuda() && bin_bounds.is_contiguous(),
+              "QB bin_bounds must be a contiguous CUDA tensor");
+  TORCH_CHECK(bin_bounds.device() == logits.device(), "QB bin_bounds must be on the logits device");
+  TORCH_CHECK(
+      bin_bounds.scalar_type() == at::kFloat && bin_bounds.dim() == 1 && bin_bounds.numel() == 2,
+      "QB bin_bounds must be float32 with shape [2]");
+  TORCH_CHECK(histogram_mode == NVTE_QB_HISTOGRAM_TWO_KERNEL ||
+                  histogram_mode == NVTE_QB_HISTOGRAM_FUSED_ATOMIC,
+              "Unsupported QB histogram mode: ", histogram_mode);
+  if (topk_indices.has_value()) {
+    TORCH_CHECK(routing_map_format == NVTE_ROUTING_MAP_FORMAT_BYTEMAP,
+                "dense Top-k indices cannot be combined with a non-default routing-map format");
+    check_dense_topk_indices(topk_indices.value(), logits, sizes.slice(0, sizes.size() - 1), topk);
+  }
+
+  const float scaling_factor_value = scaling_factor.has_value() ? scaling_factor.value() : 1.0f;
+  at::Tensor probs = at::empty(sizes, at::dtype(logits.scalar_type()).device(logits.device()));
+  at::Tensor routing_output =
+      topk_indices.has_value()
+          ? topk_indices.value()
+          : allocate_routing_map(sizes.slice(0, sizes.size() - 1), num_experts, routing_map_format);
+  at::Tensor intermediate_output = at::empty(sizes, at::dtype(at::kFloat).device(logits.device()));
+  at::Tensor cutoff = at::empty({num_tokens}, at::dtype(at::kFloat).device(logits.device()));
+
+  const std::vector<size_t> shape_2d = {static_cast<size_t>(num_tokens),
+                                        static_cast<size_t>(num_experts)};
+  const std::vector<size_t> routing_output_shape_2d =
+      topk_indices.has_value()
+          ? std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(topk)}
+          : std::vector<size_t>{
+                static_cast<size_t>(num_tokens),
+                static_cast<size_t>(routing_map_format == NVTE_ROUTING_MAP_FORMAT_BITMAP_U8
+                                        ? (num_experts + 7) / 8
+                                        : num_experts)};
+  auto logits_cu = makeTransformerEngineTensor(logits.data_ptr(), shape_2d,
+                                               GetTransformerEngineDType(logits.scalar_type()));
+  auto probs_cu = makeTransformerEngineTensor(probs.data_ptr(), shape_2d,
+                                              GetTransformerEngineDType(probs.scalar_type()));
+  auto routing_output_cu =
+      makeTransformerEngineTensor(routing_output.data_ptr(), routing_output_shape_2d,
+                                  GetTransformerEngineDType(routing_output.scalar_type()));
+  auto intermediate_output_cu =
+      makeTransformerEngineTensor(intermediate_output.data_ptr(), shape_2d, DType::kFloat32);
+  const std::vector<size_t> cutoff_shape = {static_cast<size_t>(num_tokens)};
+  auto cutoff_cu = makeTransformerEngineTensor(cutoff.data_ptr(), cutoff_shape, DType::kFloat32);
+  auto expert_bias_cu = makeTransformerEngineTensor(expert_bias);
+  auto histogram_cu = makeTransformerEngineTensor(histogram);
+  auto bin_bounds_cu = makeTransformerEngineTensor(bin_bounds);
+  const auto mode = static_cast<NVTEQBHistogramMode>(histogram_mode);
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  if (topk_indices.has_value()) {
+    nvte_fused_topk_with_score_function_forward_qb_with_indices(
+        logits_cu.data(), static_cast<int>(num_tokens), static_cast<int>(num_experts), topk,
+        scaling_factor_value, expert_bias_cu.data(), probs_cu.data(), routing_output_cu.data(),
+        intermediate_output_cu.data(), cutoff_cu.data(), histogram_cu.data(), bin_bounds_cu.data(),
+        mode, stream);
+  } else {
+    nvte_fused_topk_with_score_function_forward_qb_v2(
+        logits_cu.data(), static_cast<int>(num_tokens), static_cast<int>(num_experts), topk,
+        scaling_factor_value, expert_bias_cu.data(), probs_cu.data(), routing_output_cu.data(),
+        static_cast<NVTERoutingMapFormat>(routing_map_format), intermediate_output_cu.data(),
+        cutoff_cu.data(), histogram_cu.data(), bin_bounds_cu.data(), mode, stream);
+  }
+  if (mode == NVTE_QB_HISTOGRAM_TWO_KERNEL) {
+    nvte_qb_histogram_accumulate(intermediate_output_cu.data(), cutoff_cu.data(),
+                                 bin_bounds_cu.data(), histogram_cu.data(), stream);
+  }
+
+  return std::make_tuple(probs, routing_output, intermediate_output, cutoff, histogram);
+}
+
 void fused_topk_with_score_function_bwd(at::Tensor routing_map, at::Tensor intermediate_output,
                                         at::Tensor grad_probs, at::Tensor grad_logits, int topk,
                                         bool use_pre_softmax, std::optional<float> scaling_factor,
@@ -296,11 +400,34 @@ void fused_score_for_moe_aux_loss_bwd(at::Tensor intermediate_output, at::Tensor
       at::cuda::getCurrentCUDAStream());
 }
 
+std::pair<std::vector<size_t>, DType> get_moe_aux_loss_workspace_config() {
+  TensorWrapper workspace;
+  // Query the operation with an empty workspace, then let Python own the
+  // allocation and its per-stream or CUDA Graph lifetime.
+  nvte_fused_moe_aux_loss_forward_v2(nullptr, nullptr, 0, 0, 0, 0, 0, 0.0f, nullptr, nullptr,
+                                     workspace.data(), nullptr);
+  const auto shape = workspace.shape();
+  return {std::vector<size_t>(shape.data, shape.data + shape.ndim), workspace.dtype()};
+}
+
+static TensorWrapper make_aux_loss_workspace(const std::optional<at::Tensor> &workspace,
+                                             const at::Tensor &probs) {
+  TORCH_CHECK(workspace.has_value(), "deterministic aux loss requires a workspace");
+  TORCH_CHECK(workspace->is_cuda() && workspace->device() == probs.device(),
+              "aux-loss workspace must be on the same CUDA device as probs");
+  TORCH_CHECK(workspace->scalar_type() == at::kFloat && workspace->is_contiguous(),
+              "aux-loss workspace must be contiguous FP32 storage");
+  TORCH_CHECK(workspace->numel() > 0, "aux-loss workspace must not be empty");
+  return makeTransformerEngineTensor(*workspace);
+}
+
 std::tuple<at::Tensor, at::Tensor> fused_moe_aux_loss_fwd(at::Tensor probs,
                                                           at::Tensor tokens_per_expert,
                                                           int total_num_tokens, int num_experts,
                                                           int num_rows, int num_cols, int topk,
-                                                          float coeff) {
+                                                          float coeff, bool deterministic,
+                                                          std::optional<at::Tensor> workspace) {
+  at::cuda::CUDAGuard device_guard(probs.device());
   TORCH_CHECK(topk > 0, "topk must be greater than 0");
   TORCH_CHECK(total_num_tokens > 0, "total_num_tokens must be greater than 0");
   TORCH_CHECK(num_experts > 0, "num_experts must be greater than 0");
@@ -314,16 +441,27 @@ std::tuple<at::Tensor, at::Tensor> fused_moe_aux_loss_fwd(at::Tensor probs,
   auto aux_loss_cu = makeTransformerEngineTensor(aux_loss);
   auto Const_buf_cu = makeTransformerEngineTensor(Const_buf);
 
-  nvte_fused_moe_aux_loss_forward(probs_cu.data(), tokens_per_expert_cu.data(), total_num_tokens,
-                                  num_experts, num_rows, num_cols, topk, coeff, aux_loss_cu.data(),
-                                  Const_buf_cu.data(), at::cuda::getCurrentCUDAStream());
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  if (!deterministic) {
+    nvte_fused_moe_aux_loss_forward(probs_cu.data(), tokens_per_expert_cu.data(), total_num_tokens,
+                                    num_experts, num_rows, num_cols, topk, coeff,
+                                    aux_loss_cu.data(), Const_buf_cu.data(), stream);
+    return std::make_tuple(aux_loss, Const_buf);
+  }
+
+  auto workspace_cu = make_aux_loss_workspace(workspace, probs);
+  nvte_fused_moe_aux_loss_forward_v2(
+      probs_cu.data(), tokens_per_expert_cu.data(), total_num_tokens, num_experts, num_rows,
+      num_cols, topk, coeff, aux_loss_cu.data(), Const_buf_cu.data(), workspace_cu.data(), stream);
 
   return std::make_tuple(aux_loss, Const_buf);
 }
 
 std::tuple<at::Tensor, at::Tensor> fused_moe_aux_loss_fwd_graph_safe(
     at::Tensor probs, at::Tensor tokens_per_expert, at::Tensor total_num_tokens, int num_experts,
-    int num_rows, int num_cols, int topk, float coeff) {
+    int num_rows, int num_cols, int topk, float coeff, bool deterministic,
+    std::optional<at::Tensor> workspace) {
+  at::cuda::CUDAGuard device_guard(probs.device());
   TORCH_CHECK(topk > 0, "topk must be greater than 0");
   TORCH_CHECK(num_experts > 0, "num_experts must be greater than 0");
   // Device-tensor path: keep total_num_tokens dynamic across CUDA Graph replays.
@@ -344,10 +482,19 @@ std::tuple<at::Tensor, at::Tensor> fused_moe_aux_loss_fwd_graph_safe(
   auto aux_loss_cu = makeTransformerEngineTensor(aux_loss);
   auto Const_buf_cu = makeTransformerEngineTensor(Const_buf);
 
-  nvte_fused_moe_aux_loss_forward_graph_safe(probs_cu.data(), tokens_per_expert_cu.data(),
-                                             total_num_tokens_cu.data(), num_experts, num_rows,
-                                             num_cols, topk, coeff, aux_loss_cu.data(),
-                                             Const_buf_cu.data(), at::cuda::getCurrentCUDAStream());
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  if (!deterministic) {
+    nvte_fused_moe_aux_loss_forward_graph_safe(
+        probs_cu.data(), tokens_per_expert_cu.data(), total_num_tokens_cu.data(), num_experts,
+        num_rows, num_cols, topk, coeff, aux_loss_cu.data(), Const_buf_cu.data(), stream);
+    return std::make_tuple(aux_loss, Const_buf);
+  }
+
+  auto workspace_cu = make_aux_loss_workspace(workspace, probs);
+  nvte_fused_moe_aux_loss_forward_graph_safe_v2(probs_cu.data(), tokens_per_expert_cu.data(),
+                                                total_num_tokens_cu.data(), num_experts, num_rows,
+                                                num_cols, topk, coeff, aux_loss_cu.data(),
+                                                Const_buf_cu.data(), workspace_cu.data(), stream);
 
   return std::make_tuple(aux_loss, Const_buf);
 }

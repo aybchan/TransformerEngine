@@ -19,22 +19,25 @@
 extern "C" {
 #endif
 
+#include <transformer_engine/nvfp4/4over6.h>
+
 /*! \enum NVTEDType
  *  \brief TE datatype.
  */
 enum NVTEDType {
-  kNVTEByte = 0,        /*!< Byte */
-  kNVTEInt16 = 1,       /*!< 16-bit integer */
-  kNVTEInt32 = 2,       /*!< 32-bit integer */
-  kNVTEInt64 = 3,       /*!< 64-bit integer */
-  kNVTEFloat32 = 4,     /*!< 32-bit float */
-  kNVTEFloat16 = 5,     /*!< 16-bit float (E5M10) */
-  kNVTEBFloat16 = 6,    /*!< 16-bit bfloat (E8M7) */
-  kNVTEFloat8E4M3 = 7,  /*!< 8-bit float (E4M3) */
-  kNVTEFloat8E5M2 = 8,  /*!< 8-bit float (E5M2) */
-  kNVTEFloat8E8M0 = 9,  /*!< 8-bit float (E8M0) */
-  kNVTEFloat4E2M1 = 10, /*!< 4-bit float (E2M1) */
-  kNVTENumTypes         /*!< Number of supported types */
+  kNVTEByte = 0,         /*!< Byte */
+  kNVTEInt16 = 1,        /*!< 16-bit integer */
+  kNVTEInt32 = 2,        /*!< 32-bit integer */
+  kNVTEInt64 = 3,        /*!< 64-bit integer */
+  kNVTEFloat32 = 4,      /*!< 32-bit float */
+  kNVTEFloat16 = 5,      /*!< 16-bit float (E5M10) */
+  kNVTEBFloat16 = 6,     /*!< 16-bit bfloat (E8M7) */
+  kNVTEFloat8E4M3 = 7,   /*!< 8-bit float (E4M3) */
+  kNVTEFloat8E5M2 = 8,   /*!< 8-bit float (E5M2) */
+  kNVTEFloat8E8M0 = 9,   /*!< 8-bit float (E8M0) */
+  kNVTEFloat4E2M1 = 10,  /*!< 4-bit float (E2M1) */
+  kNVTEFloat8UE5M3 = 11, /*!< 8-bit float (UE5M3) */
+  kNVTENumTypes          /*!< Number of supported types */
 };
 
 /*! \struct NVTEShape
@@ -83,11 +86,15 @@ enum NVTETensorParam {
    *  its values are populated during quantization.
    */
   kNVTERowScaledNVFP4 = 8,
-  /*! Global E4M3 scale bound used by an NVFP4 tensor.
+  /*! Global scale bound used by an NVFP4 tensor.
    *
-   *  This is part of the tensor data contract. Downstream dequantization and
-   *  GEMM scale consumers must use the same bound used during quantization.
-   *  Standard NVFP4 uses 448; 4over6 may use 256 for map-to-4 headroom.
+   *  When non-zero, this overrides the maximum value of the scaling
+   *  factors. This affects downstream consumers (like GEMM or
+   *  dequantization) because the maximum values of the FP4 type and
+   *  scale type are used to convert amax values to tensor scales.
+   *
+   *  Standard NVFP4 uses the maximum value of the scale type (448 for
+   *  E4M3). 4over6 may use 256 for map-to-4 headroom.
    */
   kNVTENVFP4E4M3Max = 9,
   kNVTENumTensorParams
@@ -116,15 +123,6 @@ enum NVTEScalingMode {
    * rowwise or columnwise direction */
   NVTE_NVFP4_1D_SCALING = 4,
   NVTE_INVALID_SCALING = 100
-};
-
-/*! \enum NVTENVFP44Over6Mode
- * \brief Method for NVFP4 4over6 quantization.
- */
-enum NVTENVFP44Over6Mode {
-  kNVTENVFP44Over6Disabled = 0, /*!< 4over6 is not applied */
-  kNVTENVFP44Over6MinMAE = 1,   /*!< Select the candidate with lower mean absolute error */
-  kNVTENVFP44Over6MinMSE = 2,   /*!< Select the candidate with lower mean squared error */
 };
 
 /*! \brief TE Tensor type
@@ -436,6 +434,8 @@ enum NVTEQuantizationConfigAttribute {
    *  of ordinary NVFP4 fast-math settings.
    */
   kNVTEQuantizationConfigNVFP44Over6ErrUseFastMath = 9,
+  /*! Whether to use 2D block scaling for MXFP8 */
+  kNVTEQuantizationConfigMXFP82DQuantization = 10,
   kNVTEQuantizationConfigNumAttributes
 };
 
@@ -546,6 +546,19 @@ void nvte_splits_to_offsets_multi(NVTETensor split_sizes, NVTETensor *outputs,
                                   const int64_t *strides, const int *include_leading_zero,
                                   size_t num_outputs, cudaStream_t stream);
 
+/*! \brief Compute multiple scaled offsets and assert row split alignment on the device.
+ *
+ * This uses the same prefix-sum kernel as nvte_splits_to_offsets_multi and does not synchronize
+ * the host, so the validation remains active during CUDA graph replay.
+ *
+ * \param[in] split_alignment Positive required divisor of every split size.
+ * \see nvte_splits_to_offsets_multi for the remaining parameters.
+ */
+void nvte_splits_to_offsets_multi_v2(NVTETensor split_sizes, size_t split_alignment,
+                                     NVTETensor *outputs, const int64_t *strides,
+                                     const int *include_leading_zero, size_t num_outputs,
+                                     cudaStream_t stream);
+
 /*! \brief TE Grouped Tensor type
  *
  * NVTEGroupedTensor is a collection of tensors with potentially different shapes
@@ -570,6 +583,8 @@ enum NVTEGroupedTensorParam {
       9, /*!< Tensor offsets for contiguous layout (device pointer to int64_t array) */
   kNVTEGroupedWithGEMMSwizzledScales =
       10, /*!< Whether scaling factors are in format expected by GEMM */
+  kNVTEGroupedRowScaledNVFP4 =
+      11, /*!< Whether NVFP4 data uses row scaling instead of tensor scaling */
   kNVTENumGroupedTensorParams
 };
 
@@ -687,12 +702,16 @@ enum class DType {
   kFloat8E5M2 = 8,
   kFloat8E8M0 = 9,
   kFloat4E2M1 = 10,
+  kFloat8UE5M3 = 11,
   kNumTypes
 };
 
 /*! \brief Check if TE datatype is FP8
  *
- * Return true if TE datatype is FP8
+ *  Return whether datatype is FP8 E4M3 or FP8 E5M2. Other FP8 formats
+ *  (E8M0, UE5M3) are not used as primary data encoding, but are
+ *  auxiliary types for block scaling formats.
+ *
  *  \param[in] t      TE Datatype of interest
  */
 inline bool is_fp8_dtype(const DType t) {
@@ -922,7 +941,7 @@ class TensorWrapper {
   }
 
   int get_nvfp4_e4m3_max() const {
-    int val = 448;
+    int val = 0;
     nvte_get_tensor_param_v2(tensor_, kNVTENVFP4E4M3Max, &val, sizeof(val), nullptr);
     return val;
   }
@@ -1298,6 +1317,11 @@ class GroupedTensorWrapper {
     nvte_set_grouped_tensor_param(tensor_, kNVTEGroupedWithGEMMSwizzledScales, &val, sizeof(val));
   }
 
+  void set_row_scaled_nvfp4(bool row_scaled_nvfp4) {
+    const auto val = static_cast<uint8_t>(row_scaled_nvfp4);
+    nvte_set_grouped_tensor_param(tensor_, kNVTEGroupedRowScaledNVFP4, &val, sizeof(val));
+  }
+
   // Parameter getters
   NVTEBasicTensor get_parameter(const NVTEGroupedTensorParam param) const noexcept {
     NVTEBasicTensor ret;
@@ -1341,6 +1365,12 @@ class GroupedTensorWrapper {
     uint8_t val = 0;
     nvte_get_grouped_tensor_param(tensor_, kNVTEGroupedWithGEMMSwizzledScales, &val, sizeof(val),
                                   nullptr);
+    return static_cast<bool>(val);
+  }
+
+  bool get_row_scaled_nvfp4() const {
+    uint8_t val = 0;
+    nvte_get_grouped_tensor_param(tensor_, kNVTEGroupedRowScaledNVFP4, &val, sizeof(val), nullptr);
     return static_cast<bool>(val);
   }
 
@@ -1472,6 +1502,13 @@ class QuantizationConfigWrapper {
   void set_nvfp4_2d_quantization(bool nvfp4_2d_quantization) {
     const auto val = static_cast<uint8_t>(nvfp4_2d_quantization);
     nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigNVFP42DQuantization,
+                                           &val, sizeof(val));
+  }
+
+  /*! \brief Set whether to use 2D block scaling for MXFP8 */
+  void set_mxfp8_2d_quantization(bool mxfp8_2d_quantization) {
+    const auto val = static_cast<uint8_t>(mxfp8_2d_quantization);
+    nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigMXFP82DQuantization,
                                            &val, sizeof(val));
   }
 

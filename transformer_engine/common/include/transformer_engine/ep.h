@@ -11,7 +11,14 @@
  *  Per layer: call nvte_ep_handle_mem_size(layer_cfg) for the buffer size;
  *  allocate handle_mem as a kByte NVTETensor. Per step: nvte_ep_prepare seeds
  *  routing, then nvte_ep_dispatch / nvte_ep_combine / _bwd consume it.
- *  Cache cap: NVTE_EP_HANDLE_CACHE_SIZE (default 4096; -1 disables eviction).
+ *  The handle cache is disabled by default, so handle_mem may be relocated between calls.
+ *  The *_v2 ops take the layer config explicitly and bind from handle_mem; they do not use
+ *  the cache.
+ *
+ *  Deprecated: the handle cache, NVTE_EP_HANDLE_CACHE_SIZE (max live handles; -1 = unlimited;
+ *  default 0 = disabled) and the non-v2 per-step ops (nvte_ep_dispatch, nvte_ep_combine,
+ *  nvte_ep_dispatch_bwd, nvte_ep_combine_bwd) will be removed in TE 3.0. The non-v2 ops
+ *  require the cache to be enabled via NVTE_EP_HANDLE_CACHE_SIZE. Use the *_v2 ops.
  */
 
 #ifndef TRANSFORMER_ENGINE_EP_H_
@@ -49,7 +56,7 @@ typedef struct {
   int max_recv_tokens_per_rank;
   /*! Token hidden dimension. */
   int hidden_dim;
-  /*! Max SMs for NCCL EP dispatch/combine kernels. 0 = auto. */
+  /*! Max SMs for NCCL EP dispatch/combine kernels. 0 = default (32, clamped to device SM count). */
   int num_comm_sms;
   /*! Widest token dtype the group will dispatch; sizes staging buffers.
    *  Required (no default): must be set to a real token dtype. Per-dispatch
@@ -67,9 +74,8 @@ typedef struct {
   int drop_on_overflow;
 } NVTEEpGroupConfig;
 
-/*! \brief Per-layer configuration consumed by nvte_ep_handle_mem_size and
- *         nvte_ep_prepare. Reserved for future per-call options (fp8 scale,
- *         overflow policy, ...).
+/*! \brief Per-layer configuration consumed by nvte_ep_handle_mem_size,
+ *         nvte_ep_prepare and the *_v2 per-step ops.
  */
 typedef struct {
   /*! Struct size in bytes, or 0 for the base layout. Set to
@@ -81,6 +87,9 @@ typedef struct {
    *  When > 1, each expert's slab in recv_tokens is zero-padded up to a
    *  multiple of this for downstream per-expert GEMM alignment. */
   size_t dispatch_output_per_expert_alignment;
+  /*! topk_idx dtype used at prepare (kNVTEInt32 or kNVTEInt64). Read only by the
+   *  *_v2 ops. */
+  NVTEDType topk_idx_dtype;
 } NVTEEpLayerConfig;
 
 /* Zero-init a config with struct_size set to the current layout:
@@ -94,17 +103,20 @@ typedef struct {
 /*! \brief Bootstrap the EP backend from an existing NCCL EP sub-communicator.
  *         Requires SM>=90.
  *
+ *  This call validates that the runtime NCCL is >=2.30.4 and then loads the
+ *  optional libnccl_ep.so library. Non-EP users do not load the library.
+ *
  *  ep_comm is borrowed and must span exactly group_config.ep_size ranks. The
  *  caller retains ownership and must keep it alive until nvte_ep_shutdown()
  *  returns. Re-init after shutdown is allowed; double-init throws. One EP
- *  group per process, bound to the current CUDA device.
+ *  group per local device, bound to the current CUDA device.
  *
  *  \param[in] ep_comm      Opaque ncclComm_t for the EP sub-group.
  *  \param[in] group_config Group-level EP configuration (struct_size set).
  */
 void nvte_ep_initialize(void* ep_comm, const NVTEEpGroupConfig* group_config);
 
-/*! \brief Tear down the EP backend. Idempotent. Does not destroy ep_comm. */
+/*! \brief Tear down all local EP backends. Idempotent. Does not destroy ep_comm. */
 void nvte_ep_shutdown(void);
 
 /* -- Layer sizing (host-only) --------------------------------------------- */
@@ -113,8 +125,9 @@ void nvte_ep_shutdown(void);
  *
  *  handle_mem is a per-layer kByte routing-state buffer; allocate once and
  *  thread the same pointer through every prepare/dispatch/combine/_bwd call
- *  for that layer (the backend keys its cache on the pointer). Host-only;
- *  size is stable for a given (group, layer) pair.
+ *  for that layer (the handle cache, when enabled, keys on the pointer). Host-only;
+ *  returns the maximum required size across initialized local devices. Size
+ *  is stable while the initialized groups and layer config remain unchanged.
  *
  *  \param[in] layer_cfg  Per-call layer configuration (struct_size set).
  *  \return size in bytes for the handle_mem buffer.
@@ -150,6 +163,12 @@ void nvte_ep_prepare(NVTETensor handle_mem, NVTETensor topk_idx, NVTETensor recv
  *  *_win arguments enable zero-copy via symmem windows; pass NVTECommWindow{}
  *  when unused. Requires a prior nvte_ep_prepare on this handle_mem.
  *
+ *  tokens/recv_tokens may be high-precision (bf16/fp16) or FP8:
+ *  for the latter, set rowwise data and rowwise scale-inverse (unswizzled
+ *  [T, hidden_dim/block]) on the tensor and the scales are routed alongside the
+ *  data. tokens and recv_tokens must share a scaling mode. For now, only MXFP8
+ *  (NVTE_MXFP8_1D_SCALING, e4m3 data + e8m0 scales) is supported.
+ *
  *  \param[in]     handle_mem             uint8 routing-state buffer (from prepare).
  *  \param[in]     topk_idx               [T, top_k] int64 sparse routing indices.
  *  \param[in]     tokens                 [T, hidden_dim] input tokens.
@@ -161,12 +180,60 @@ void nvte_ep_prepare(NVTETensor handle_mem, NVTETensor topk_idx, NVTETensor recv
  *  \param[out]    recv_topk_weights      [recv_T] float32 per-slot weights, or null in backward.
  *  \param[in]     recv_topk_weights_win  Optional symmem window for recv_topk_weights.
  *  \param[in]     stream                 CUDA stream.
+ *
+ *  \deprecated Relies on the handle cache; removed in TE 3.0. Use nvte_ep_dispatch_v2.
  */
 void nvte_ep_dispatch(NVTETensor handle_mem, NVTETensor topk_idx, NVTETensor tokens,
                       NVTECommWindow tokens_win, NVTETensor topk_weights,
                       NVTECommWindow topk_weights_win, NVTETensor recv_tokens,
                       NVTECommWindow recv_tokens_win, NVTETensor recv_topk_weights,
                       NVTECommWindow recv_topk_weights_win, cudaStream_t stream);
+
+/*! \brief nvte_ep_dispatch with an explicit layer configuration.
+ *
+ *  \param[in] layer_cfg  Required; must match the config used at nvte_ep_prepare.
+ *
+ *  Other parameters are as in nvte_ep_dispatch.
+ */
+void nvte_ep_dispatch_v2(NVTETensor handle_mem, NVTETensor topk_idx, NVTETensor tokens,
+                         NVTECommWindow tokens_win, NVTETensor topk_weights,
+                         NVTECommWindow topk_weights_win, NVTETensor recv_tokens,
+                         NVTECommWindow recv_tokens_win, NVTETensor recv_topk_weights,
+                         NVTECommWindow recv_topk_weights_win, const NVTEEpLayerConfig* layer_cfg,
+                         cudaStream_t stream);
+
+/*! \brief Fused prepare + dispatch.
+ *
+ *  Seeds handle_mem with this step's routing (as nvte_ep_prepare) and then
+ *  dispatches tokens (as nvte_ep_dispatch) in a single call. Per-expert recv
+ *  counts are produced by the dispatch and written to recv_tokens_per_expert;
+ *  they are not available before the dispatch returns. No separate
+ *  nvte_ep_prepare is needed. CUDA graph-capturable: the counts stay on device,
+ *  so no host-side stream sync is needed to size the recv buffers.
+ *
+ *  \param[in]     handle_mem             uint8 routing-state buffer.
+ *  \param[in]     topk_idx               [T, top_k] int64 routing indices.
+ *  \param[in]     tokens                 [T, hidden_dim] input tokens.
+ *  \param[in]     tokens_win             Optional symmem window for tokens.
+ *  \param[in]     topk_weights           [T, top_k] float32 weights.
+ *  \param[in]     topk_weights_win       Optional symmem window for topk_weights.
+ *  \param[out]    recv_tokens            [recv_T, hidden_dim] received tokens.
+ *  \param[in]     recv_tokens_win        Optional symmem window for recv_tokens.
+ *  \param[out]    recv_topk_weights      [recv_T] float32 per-slot weights.
+ *  \param[in]     recv_topk_weights_win  Optional symmem window for recv_topk_weights.
+ *  \param[out]    recv_tokens_per_expert [num_local_experts] int32/int64 counts.
+ *  \param[out]    total_recv_tokens_per_rank Optional [1] int32/int64 scalar recv total. May be null.
+ *  \param[in]     layer_cfg              Per-call layer configuration (struct_size set).
+ *  \param[in]     stream                 CUDA stream.
+ */
+void nvte_ep_prepare_and_dispatch(NVTETensor handle_mem, NVTETensor topk_idx, NVTETensor tokens,
+                                  NVTECommWindow tokens_win, NVTETensor topk_weights,
+                                  NVTECommWindow topk_weights_win, NVTETensor recv_tokens,
+                                  NVTECommWindow recv_tokens_win, NVTETensor recv_topk_weights,
+                                  NVTECommWindow recv_topk_weights_win,
+                                  NVTETensor recv_tokens_per_expert,
+                                  NVTETensor total_recv_tokens_per_rank,
+                                  const NVTEEpLayerConfig* layer_cfg, cudaStream_t stream);
 
 /*! \brief Scatter-sum expert outputs back to originating ranks.
  *
@@ -180,9 +247,15 @@ void nvte_ep_dispatch(NVTETensor handle_mem, NVTETensor topk_idx, NVTETensor tok
  *  \param[in]  expert_out_win  Optional symmem window for expert_out.
  *  \param[out] result          [T, hidden_dim] combined output.
  *  \param[in]  stream          CUDA stream.
+ *
+ *  \deprecated Relies on the handle cache; removed in TE 3.0. Use nvte_ep_combine_v2.
  */
 void nvte_ep_combine(NVTETensor handle_mem, NVTETensor expert_out, NVTECommWindow expert_out_win,
                      NVTETensor result, cudaStream_t stream);
+
+/*! \brief nvte_ep_combine with an explicit layer configuration (see nvte_ep_dispatch_v2). */
+void nvte_ep_combine_v2(NVTETensor handle_mem, NVTETensor expert_out, NVTECommWindow expert_out_win,
+                        NVTETensor result, const NVTEEpLayerConfig* layer_cfg, cudaStream_t stream);
 
 /*! \brief Backward of dispatch: route per-recv-slot grads back to source.
  *
@@ -198,11 +271,19 @@ void nvte_ep_combine(NVTETensor handle_mem, NVTETensor expert_out, NVTECommWindo
  *  \param[out] grad_tokens              [T, hidden_dim] grad w.r.t. tokens.
  *  \param[out] grad_topk_weights        [T, top_k] f32 grad w.r.t. topk_weights.
  *  \param[in]  stream                   CUDA stream.
+ *
+ *  \deprecated Relies on the handle cache; removed in TE 3.0. Use nvte_ep_dispatch_bwd_v2.
  */
 void nvte_ep_dispatch_bwd(NVTETensor handle_mem, NVTETensor grad, NVTECommWindow grad_win,
                           NVTETensor g_recv_topk_weights, NVTECommWindow g_recv_topk_weights_win,
                           NVTETensor grad_tokens, NVTETensor grad_topk_weights,
                           cudaStream_t stream);
+
+/*! \brief nvte_ep_dispatch_bwd with an explicit layer configuration (see nvte_ep_dispatch_v2). */
+void nvte_ep_dispatch_bwd_v2(NVTETensor handle_mem, NVTETensor grad, NVTECommWindow grad_win,
+                             NVTETensor g_recv_topk_weights, NVTECommWindow g_recv_topk_weights_win,
+                             NVTETensor grad_tokens, NVTETensor grad_topk_weights,
+                             const NVTEEpLayerConfig* layer_cfg, cudaStream_t stream);
 
 /*! \brief Backward of combine: replicate each source-token grad to its recv
  *         slots from the forward.
@@ -216,10 +297,17 @@ void nvte_ep_dispatch_bwd(NVTETensor handle_mem, NVTETensor grad, NVTECommWindow
  *  \param[out] grad_expert_out      [recv_capacity, hidden_dim] grad w.r.t. expert_out.
  *  \param[in]  grad_expert_out_win  Optional symmem window for grad_expert_out.
  *  \param[in]  stream               CUDA stream.
+ *
+ *  \deprecated Relies on the handle cache; removed in TE 3.0. Use nvte_ep_combine_bwd_v2.
  */
 void nvte_ep_combine_bwd(NVTETensor handle_mem, NVTETensor grad, NVTECommWindow grad_win,
                          NVTETensor grad_expert_out, NVTECommWindow grad_expert_out_win,
                          cudaStream_t stream);
+
+/*! \brief nvte_ep_combine_bwd with an explicit layer configuration (see nvte_ep_dispatch_v2). */
+void nvte_ep_combine_bwd_v2(NVTETensor handle_mem, NVTETensor grad, NVTECommWindow grad_win,
+                            NVTETensor grad_expert_out, NVTECommWindow grad_expert_out_win,
+                            const NVTEEpLayerConfig* layer_cfg, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

@@ -13,11 +13,15 @@ Precision Notes:
 - Only cast to low-precision when necessary and the casting only happens in writing to
   global memory. For example, the gradient is required to have the same dtype as the input.
 """
+
+import functools
+import warnings
 from typing import Optional, Union
 
 import torch
 import transformer_engine_torch as tex
 
+from .constants import TE_DType_To_Torch
 
 # Re-export the C++ enum NVTERoutingMapFormat under a friendlier Python name.
 # Members:
@@ -26,6 +30,7 @@ import transformer_engine_torch as tex
 #                                LSB-first / little-endian packing along the
 #                                expert axis.
 RoutingMapFormat = tex.NVTERoutingMapFormat
+QBHistogramMode = tex.NVTEQBHistogramMode
 
 
 _ROUTING_MAP_FORMAT_FROM_STRING = {
@@ -33,9 +38,31 @@ _ROUTING_MAP_FORMAT_FROM_STRING = {
     "bitmap_u8": int(RoutingMapFormat.BITMAP_U8),
 }
 _VALID_ROUTING_MAP_FORMAT_INTS = frozenset(_ROUTING_MAP_FORMAT_FROM_STRING.values())
+_QB_HISTOGRAM_MODE_FROM_STRING = {
+    "two_kernel": int(QBHistogramMode.TWO_KERNEL),
+    "fused_atomic": int(QBHistogramMode.FUSED_ATOMIC),
+}
 
 
-def _validate_routing_map_format(routing_map_format: Union[str, RoutingMapFormat, int]) -> int:
+def mark_qb_bin_bounds_validated(
+    bin_bounds: torch.Tensor,  # pylint: disable=unused-argument
+) -> None:
+    """Deprecated no-op.
+
+    QB ``bin_bounds`` values are no longer validated, so there is nothing to mark. This function
+    will be removed in a future release.
+    """
+    warnings.warn(
+        "mark_qb_bin_bounds_validated is deprecated and has no effect because QB bin_bounds "
+        "values are no longer validated. It will be removed in a future release.",
+        category=DeprecationWarning,
+        stacklevel=2,
+    )
+
+
+def _validate_routing_map_format(
+    routing_map_format: Union[str, RoutingMapFormat, int],
+) -> int:
     """Coerce user-supplied routing_map_format into a plain int (0 or 1).
 
     Accepts the enum, an int matching one of the enum's values, or the
@@ -134,6 +161,74 @@ class FusedTopkScoreFunction(torch.autograd.Function):
         return grad_logits, None, None, None, None, None, None, None, None, None
 
 
+class FusedTopkScoreFunctionQB(torch.autograd.Function):
+    """Kimi K3 QB router with histogram accumulation."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        logits: torch.Tensor,
+        topk: int,
+        scaling_factor: Optional[float],
+        expert_bias: torch.Tensor,
+        routing_map_format: int,
+        topk_indices: Optional[torch.Tensor],
+        histogram: torch.Tensor,
+        bin_bounds: torch.Tensor,
+        histogram_mode: int,
+    ):
+        # pylint: disable=missing-function-docstring
+        (
+            probs,
+            routing_output,
+            intermediate_output,
+            _cutoff,
+            histogram_output,
+        ) = tex.fused_topk_with_score_function_qb_fwd(
+            logits,
+            topk,
+            scaling_factor,
+            expert_bias,
+            routing_map_format,
+            topk_indices,
+            histogram,
+            bin_bounds,
+            histogram_mode,
+        )
+        if topk_indices is not None:
+            routing_output = topk_indices
+            ctx.mark_dirty(topk_indices)
+        ctx.mark_dirty(histogram)
+        ctx.mark_non_differentiable(routing_output, histogram_output)
+        ctx.save_for_backward(routing_output, intermediate_output)
+        ctx.topk = topk
+        ctx.scaling_factor = scaling_factor
+        ctx.routing_map_format = routing_map_format
+        ctx.use_dense_indices = topk_indices is not None
+        return probs, routing_output, histogram_output
+
+    @staticmethod
+    def backward(ctx, grad_probs, _, _histogram_grad):
+        # pylint: disable=missing-function-docstring
+        routing_output, intermediate_output = ctx.saved_tensors
+        if not grad_probs.is_contiguous():
+            grad_probs = grad_probs.contiguous()
+        grad_logits = torch.empty_like(grad_probs)
+        tex.fused_topk_with_score_function_bwd(
+            routing_output,
+            intermediate_output,
+            grad_probs,
+            grad_logits,
+            ctx.topk,
+            False,
+            ctx.scaling_factor,
+            "sigmoid",
+            ctx.use_dense_indices,
+            ctx.routing_map_format,
+        )
+        return grad_logits, None, None, None, None, None, None, None, None
+
+
 def fused_topk_with_score_function(
     logits: torch.Tensor,
     topk: int,
@@ -145,9 +240,13 @@ def fused_topk_with_score_function(
     expert_bias: Optional[torch.Tensor],
     routing_map_format: Union[str, RoutingMapFormat, int] = RoutingMapFormat.BYTEMAP,
     topk_indices: Optional[torch.Tensor] = None,
+    qb_histogram: Optional[torch.Tensor] = None,
+    qb_bin_bounds: Optional[torch.Tensor] = None,
+    qb_histogram_mode: Optional[str] = None,
 ):
     """
     Fused topk with score function router.
+
     Parameters
     ----------
     logits : torch.Tensor in fp32/bf16/fp16
@@ -172,6 +271,15 @@ def fused_topk_with_score_function(
     topk_indices : torch.Tensor, optional
         Optional output buffer with shape [num_tokens, topk]. When provided, its dtype
         controls the dense index output dtype and the routing map is not materialized.
+    qb_histogram : torch.Tensor, optional
+        Caller-owned int32 ``[num_experts, num_bins]`` histogram accumulated in place.
+    qb_bin_bounds : torch.Tensor, optional
+        FP32 CUDA tensor ``[lower, upper]`` defining uniform QB histogram bins. Values must be
+        finite with ``lower < upper``. The values are only read on the device and are not
+        validated, so the tensor may be updated in place at any time, including inside a CUDA
+        graph. Invalid bounds silently produce an incorrect histogram.
+    qb_histogram_mode : str, optional
+        ``"two_kernel"`` or ``"fused_atomic"``. Must be provided with the two QB tensors.
 
     Returns
     -------
@@ -179,14 +287,45 @@ def fused_topk_with_score_function(
         Same shape as ``logits``.
     routing_map : torch.Tensor
         Same leading dims as ``logits``; trailing dim and dtype depend on
-        routing_map_format, or dense top-k indices when topk_indices is provided:
-        - BYTEMAP:   bool[*logits.shape[:-1], num_experts]
-        - BITMAP_U8: uint8[*logits.shape[:-1], ceil(num_experts/8)]
+        ``routing_map_format``, or dense top-k indices when ``topk_indices`` is provided:
+
+        - BYTEMAP: ``bool[*logits.shape[:-1], num_experts]``
+        - BITMAP_U8: ``uint8[*logits.shape[:-1], ceil(num_experts/8)]``,
           LSB-first bit-packed.
     """
     if logits.dtype == torch.float64:
         raise ValueError("Current TE does not support float64 router type.")
     routing_map_format = _validate_routing_map_format(routing_map_format)
+    qb_arguments = (qb_histogram, qb_bin_bounds, qb_histogram_mode)
+    if any(value is not None for value in qb_arguments):
+        if any(value is None for value in qb_arguments):
+            raise ValueError(
+                "qb_histogram, qb_bin_bounds, and qb_histogram_mode must be provided together"
+            )
+        if score_function != "sigmoid":
+            raise ValueError("Quantile Balancing only supports score_function='sigmoid'")
+        if expert_bias is None:
+            raise ValueError("Quantile Balancing requires expert_bias")
+        if num_groups is not None or group_topk is not None:
+            raise ValueError("Quantile Balancing does not support grouped Top-k")
+        mode = _QB_HISTOGRAM_MODE_FROM_STRING.get(qb_histogram_mode)
+        if mode is None:
+            raise ValueError(
+                "qb_histogram_mode must be 'two_kernel' or 'fused_atomic', "
+                f"got {qb_histogram_mode!r}"
+            )
+        probs, routing_output, _ = FusedTopkScoreFunctionQB.apply(
+            logits,
+            topk,
+            scaling_factor,
+            expert_bias,
+            routing_map_format,
+            topk_indices,
+            qb_histogram,
+            qb_bin_bounds,
+            mode,
+        )
+        return probs, routing_output
     return FusedTopkScoreFunction.apply(
         logits,
         topk,
@@ -278,6 +417,33 @@ def fused_compute_score_for_moe_aux_loss(
     return FusedComputeScoresForMoEAuxLoss.apply(logits, topk, score_function, routing_map_format)
 
 
+@functools.lru_cache(maxsize=None)
+def _get_moe_aux_loss_workspace_config() -> tuple[tuple[int, ...], torch.dtype]:
+    """Scratch metadata, queried once through the common forward operation."""
+    shape, dtype = tex.get_moe_aux_loss_workspace_config()
+    return tuple(shape), TE_DType_To_Torch[dtype]
+
+
+@functools.lru_cache(maxsize=None)
+def _get_cached_moe_aux_loss_workspace(device_index: int, _stream_handle: int) -> torch.Tensor:
+    """Persistent scratch for eager calls, with independent storage for each stream."""
+    # _stream_handle is part of the cache key: concurrent streams must not share scratch.
+    shape, dtype = _get_moe_aux_loss_workspace_config()
+    return torch.empty(shape, dtype=dtype, device=device_index)
+
+
+def _get_moe_aux_loss_workspace(device: torch.device) -> torch.Tensor:
+    """Reuse eager scratch; give captured operations private graph-pool storage."""
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            # Allocate only during capture, never on replay. Do not cache graph-pool
+            # storage: a graph may replay concurrently with eager work or another graph.
+            shape, dtype = _get_moe_aux_loss_workspace_config()
+            return torch.empty(shape, dtype=dtype, device=device)
+        stream = torch.cuda.current_stream(device)
+        return _get_cached_moe_aux_loss_workspace(stream.device.index, stream.cuda_stream)
+
+
 class FusedAuxLoss(torch.autograd.Function):
     """
     Fused MoE aux loss. ``total_num_tokens`` may be either a Python int
@@ -294,10 +460,12 @@ class FusedAuxLoss(torch.autograd.Function):
         num_experts: int,
         topk: int,
         coeff: float,
+        deterministic: bool,
     ):
         # pylint: disable=missing-function-docstring
         num_rows = probs.size(0)
         num_cols = probs.size(1)
+        workspace = _get_moe_aux_loss_workspace(probs.device) if deterministic else None
         if isinstance(total_num_tokens, torch.Tensor):
             aux_loss, Const_buf = tex.fused_moe_aux_loss_fwd_graph_safe(
                 probs=probs,
@@ -308,6 +476,8 @@ class FusedAuxLoss(torch.autograd.Function):
                 num_cols=num_cols,
                 topk=topk,
                 coeff=coeff,
+                deterministic=deterministic,
+                workspace=workspace,
             )
         else:
             aux_loss, Const_buf = tex.fused_moe_aux_loss_fwd(
@@ -319,6 +489,8 @@ class FusedAuxLoss(torch.autograd.Function):
                 num_cols=num_cols,
                 topk=topk,
                 coeff=coeff,
+                deterministic=deterministic,
+                workspace=workspace,
             )
         ctx.save_for_backward(Const_buf, tokens_per_expert)
         ctx.num_rows = num_rows
@@ -336,7 +508,7 @@ class FusedAuxLoss(torch.autograd.Function):
             num_cols=ctx.num_cols,
             grad_aux_loss=grad_aux_loss,
         )
-        return grad_probs, None, None, None, None, None
+        return grad_probs, None, None, None, None, None, None
 
 
 def fused_moe_aux_loss(
@@ -346,9 +518,11 @@ def fused_moe_aux_loss(
     num_experts: int,
     topk: int,
     coeff: float,
+    deterministic: bool = False,
 ) -> torch.Tensor:
     """
     Fused MoE aux loss.
+
     Parameters
     ----------
     probs : torch.Tensor in fp32/bf16/fp16
@@ -364,10 +538,18 @@ def fused_moe_aux_loss(
     topk : int
     coeff : float
         the coefficient of the aux loss.
+    deterministic : bool, default = False
+        Use a fixed-order two-stage FP32 reduction instead of atomic accumulation.
+        Repeated calls with identical inputs on the same hardware and software
+        are bitwise reproducible. Results may differ from other reduction orders.
+        Eager calls reuse scratch per device and stream; CUDA Graph capture uses
+        private scratch that is reused on replay.
 
     Returns
     -------
     aux_loss : torch.Tensor.
         A scalar tensor in the same dtype as the "probs".
     """
-    return FusedAuxLoss.apply(probs, tokens_per_expert, total_num_tokens, num_experts, topk, coeff)
+    return FusedAuxLoss.apply(
+        probs, tokens_per_expert, total_num_tokens, num_experts, topk, coeff, deterministic
+    )

@@ -10,7 +10,7 @@ transformer_engine/common/fused_router/.
 
 Functions:
     fused_topk_with_score_function:
-        Fused score_function + top-k selection. Supports softmax/sigmoid,
+        Fused score_function + top-k selection. Supports softmax/sigmoid/sqrtsoftplus,
         grouped top-k, expert bias, and scaling factor. When compute_aux_scores=True,
         switches to the clean score-for-aux-loss kernel (no bias/groups/scaling,
         dense output).
@@ -73,7 +73,8 @@ def _validate_score_function(score_function: Union[str, ScoreFunction]) -> Score
         return ScoreFunction[score_function.upper()]
     except (KeyError, AttributeError):
         raise ValueError(
-            "score_function must be 'softmax', 'sigmoid', or a ScoreFunction enum, "
+            "score_function must be 'softmax', 'sigmoid', 'sqrtsoftplus', "
+            "or a ScoreFunction enum, "
             f"got {score_function!r}"
         ) from None
 
@@ -127,9 +128,10 @@ def fused_topk_with_score_function(
         Scaling factor applied to output probs.
         Ignored when compute_aux_scores=True.
     score_function : Union[str, ScoreFunction]
-        Score function: "softmax" / "sigmoid" or ScoreFunction.SOFTMAX / ScoreFunction.SIGMOID.
+        Score function: "softmax", "sigmoid", or "sqrtsoftplus", or the corresponding
+        ScoreFunction enum member.
     expert_bias : Optional[jnp.ndarray]
-        Expert bias, shape [num_experts]. Only used with sigmoid.
+        Expert bias, shape [num_experts]. Only used with sigmoid or sqrtsoftplus.
         Ignored when compute_aux_scores=True.
     compute_aux_scores : bool
         If True, use the clean score-for-aux-loss kernel. Returns dense scores
@@ -143,14 +145,15 @@ def fused_topk_with_score_function(
     Returns
     -------
     probs_or_scores : jnp.ndarray
-        When compute_aux_scores=False: Sparse probability tensor, shape [num_tokens, num_experts].
-            Non-zero only at selected expert positions.
-        When compute_aux_scores=True: Dense score tensor, shape [num_tokens, num_experts].
-            All expert positions contain scores.
+        When ``compute_aux_scores=False``: sparse probability tensor, shape
+        ``[num_tokens, num_experts]``, non-zero only at selected expert positions.
+        When ``compute_aux_scores=True``: dense score tensor, shape
+        ``[num_tokens, num_experts]``, all expert positions contain scores.
     routing_map : jnp.ndarray
-        Shape/dtype depend on routing_map_format:
-        - BYTEMAP: bool[num_tokens, num_experts]; True at selected expert positions.
-        - BITMAP_U8: uint8[num_tokens, ceil(num_experts/8)]; LSB-first bit-packed
+        Shape/dtype depend on ``routing_map_format``:
+
+        - BYTEMAP: ``bool[num_tokens, num_experts]``; True at selected expert positions.
+        - BITMAP_U8: ``uint8[num_tokens, ceil(num_experts/8)]``; LSB-first bit-packed
           along the expert axis.
     """
     if not isinstance(scaling_factor, (int, float)):
@@ -169,9 +172,13 @@ def fused_topk_with_score_function(
         group_topk = -1
         scaling_factor = 1.0
     else:
-        if expert_bias is not None and score_function != ScoreFunction.SIGMOID:
+        if expert_bias is not None and score_function not in (
+            ScoreFunction.SIGMOID,
+            ScoreFunction.SQRTSOFTPLUS,
+        ):
             raise ValueError(
-                "expert_bias is only supported with score_function='sigmoid'. "
+                "expert_bias is only supported with score_function='sigmoid' or "
+                "'sqrtsoftplus'. "
                 f"Got score_function='{score_function.name}'."
             )
         if expert_bias is None:

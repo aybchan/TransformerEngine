@@ -16,6 +16,8 @@ from typing import Callable, List, Optional, Dict, Any, Tuple, Union
 
 import torch
 import transformer_engine_torch as tex
+
+from transformer_engine.pytorch.device import te_device_type
 from transformer_engine.common.recipe import (
     Recipe,
     DelayedScaling,
@@ -39,6 +41,7 @@ __all__ = [
     "is_mxfp8_available",
     "is_fp8_block_scaling_available",
     "is_nvfp4_available",
+    "is_fp8_ue5m3_available",
     "get_default_recipe",
     "get_align_size_for_quantization",
     "QuantizerRole",
@@ -51,6 +54,7 @@ _FP8_SUPPORT: Optional[Tuple[bool, str]] = None
 _MXFP8_SUPPORT: Optional[Tuple[bool, str]] = None
 _NVFP4_SUPPORT: Optional[Tuple[bool, str]] = None
 _FP8_BLOCK_SCALING_SUPPORT: Optional[Tuple[bool, str]] = None
+_FP8_UE5M3_SUPPORT: Optional[Tuple[bool, str]] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -221,6 +225,23 @@ def check_fp8_block_scaling_support() -> Tuple[bool, str]:
     return _FP8_BLOCK_SCALING_SUPPORT
 
 
+@torch.compiler.assume_constant_result
+def check_fp8_ue5m3_support() -> Tuple[bool, str]:
+    """Return if the FP8 UE5M3 format is available."""
+    global _FP8_UE5M3_SUPPORT
+    if _FP8_UE5M3_SUPPORT is None:
+
+        def _check_support() -> Tuple[bool, str]:
+            if get_device_compute_capability() != (10, 7):  # Rubin
+                return False, "Device compute capability 10.7 is required for FP8 UE5M3 support."
+            if float(torch.version.cuda) < 13.4:
+                return False, "CUDA 13.4 is required for FP8 UE5M3 support."
+            return True, ""
+
+        _FP8_UE5M3_SUPPORT = _check_support()
+    return _FP8_UE5M3_SUPPORT
+
+
 def check_recipe_support(recipe: Recipe) -> None:
     """Check if the given recipe is supported."""
     if torch.compiler.is_compiling() and isinstance(recipe, DelayedScaling):
@@ -233,6 +254,23 @@ def check_recipe_support(recipe: Recipe) -> None:
         recipe_supported, unsupported_reason = check_fp8_support()
     elif isinstance(recipe, Float8BlockScaling):
         recipe_supported, unsupported_reason = check_fp8_block_scaling_support()
+        if recipe_supported and get_device_compute_capability() >= (10, 0):
+            # Blackwell and newer emulate FP8 block scaling with MXFP8, whose E8M0 scales can
+            # only represent powers of 2.
+            qparams = (
+                recipe.fp8_quant_fwd_inp,
+                recipe.fp8_quant_fwd_weight,
+                recipe.fp8_quant_bwd_grad,
+            )
+            if not all(q.power_2_scale for q in qparams):
+                recipe_supported = False
+                unsupported_reason = (
+                    "On Blackwell and newer, the FP8 block scaling recipe is emulated with MXFP8,"
+                    " which requires power-of-2 scaling factors, but the recipe disables"
+                    " power_2_scale. Use power_2_scale=True, or unset"
+                    " NVTE_FP8_BLOCK_SCALING_FP32_SCALES before importing Transformer Engine"
+                    " (the recipe defaults read it at import time)."
+                )
     elif isinstance(recipe, MXFP8BlockScaling):
         recipe_supported, unsupported_reason = check_mxfp8_support()
     if not recipe_supported:
@@ -260,7 +298,17 @@ def get_default_recipe() -> Recipe:
 
 
 def get_align_size_for_quantization(recipe: Recipe) -> int:
-    """Get the alignment size for quantization."""
+    """Get the alignment used to pad grouped quantized operations.
+
+    Built-in recipes use their format requirement. Custom recipes use their
+    declarative ``quantization_alignment`` contract rather than invoking
+    ``qfactory``, since a factory may be stateful or role-dependent.
+    """
+    # TODO(#3158): Prefer module/role-specific alignment derived from canonical
+    # cached quantizers when that context is available. Keep the recipe-wide
+    # alignment as the conservative fallback for context-free callers.
+    if recipe.custom():
+        return recipe.quantization_alignment
     if recipe.mxfp8():
         return 32
     if recipe.nvfp4():
@@ -375,6 +423,26 @@ def is_nvfp4_available(return_reason: bool = False) -> Union[bool, Tuple[bool, s
     return check_nvfp4_support()[0]
 
 
+def is_fp8_ue5m3_available(return_reason: bool = False) -> Union[bool, Tuple[bool, str]]:
+    """
+    Determine if support is available for the FP8 UE5M3 data type.
+
+    This may be used for NVFP4 scaling factors.
+
+    Parameters
+    ----------
+    return_reason : bool, optional
+        If ``False`` (default), return only a boolean indicating availability.
+        If ``True``, return a tuple ``(is_available, reason)`` where ``reason`` provides
+        a human-readable explanation when required support is not available. The reason
+        will be an empty string if support is available.
+
+    """
+    if return_reason:
+        return check_fp8_ue5m3_support()
+    return check_fp8_ue5m3_support()[0]
+
+
 @dataclass(slots=True)
 class FP8GlobalState:
     """Mutable process-global FP8 state stored on an instance.
@@ -414,7 +482,7 @@ class FP8GlobalStateManager:
         """Set the skip fp8 weight update tensor"""
         if cls.quantization_state.skip_fp8_weight_update_tensor is None:
             cls.quantization_state.skip_fp8_weight_update_tensor = torch.empty(
-                1, dtype=torch.float32, device="cuda"
+                1, dtype=torch.float32, device=te_device_type()
             )
         cls.quantization_state.skip_fp8_weight_update_tensor.fill_(skip)
 
@@ -1063,7 +1131,7 @@ def _update_amax_history(amax_history: torch.Tensor) -> torch.Tensor:
     return amax_history
 
 
-@torch.jit.script
+@jit_fuser
 def _default_get_amax_and_update_history(
     amax_history: torch.Tensor,
     amax_compute_algo: str,
@@ -1422,7 +1490,7 @@ class DelayedScalingRecipeState(RecipeState):
 
         # Allocate buffers
         if device is None:
-            device = torch.device("cuda")
+            device = torch.device(te_device_type())
         self.scale = torch.ones(num_quantizers, dtype=torch.float32, device=device)
         self.amax_history = torch.zeros(
             recipe.amax_history_len,
@@ -1471,7 +1539,7 @@ class Float8CurrentScalingRecipeState(RecipeState):
 
         # Allocate buffers
         if device is None:
-            device = torch.device("cuda")
+            device = torch.device(te_device_type())
         self.device = device
 
     def make_quantizers(self) -> list:
@@ -1514,13 +1582,29 @@ class MXFP8BlockScalingRecipeState(RecipeState):
 
         # Allocate buffers
         if device is None:
-            device = torch.device("cuda")
+            device = torch.device(te_device_type())
 
     def make_quantizers(self) -> list:
         # TODO(ksivamani); Find better design for this, adding here to avoid circular import.
         from .tensor.mxfp8_tensor import MXFP8Quantizer
 
-        return [MXFP8Quantizer(self.dtype) for i in range(self.num_quantizers)]
+        if self.mode not in ("forward", "backward"):
+            raise RuntimeError(f"Unexpected recipe mode ({self.mode})")
+
+        if self.mode == "backward" or not self.recipe.enable_2d_quantization:
+            return [MXFP8Quantizer(self.dtype) for i in range(self.num_quantizers)]
+
+        def _use_2d_quantization(idx: int) -> bool:
+            role = self._slot_role(idx)
+            return role.module_type in ("linear", "grouped_linear") and role.tensor_type == "weight"
+
+        return [
+            MXFP8Quantizer(
+                self.dtype,
+                with_2d_quantization=_use_2d_quantization(idx),
+            )
+            for idx in range(self.num_quantizers)
+        ]
 
 
 class Float8BlockScalingRecipeState(RecipeState):
@@ -1556,7 +1640,7 @@ class Float8BlockScalingRecipeState(RecipeState):
 
         # Allocate buffers
         if device is None:
-            device = torch.device("cuda")
+            device = torch.device(te_device_type())
         self.device = device
 
     def make_quantizers(self) -> list:
@@ -1639,7 +1723,7 @@ class NVFP4BlockScalingRecipeState(RecipeState):
 
         # Allocate buffers
         if device is None:
-            device = torch.device("cuda")
+            device = torch.device(te_device_type())
 
     def make_quantizers(self) -> list:
         """Build one ``NVFP4Quantizer`` per slot, dispatched by tensor type.
@@ -1671,8 +1755,14 @@ class NVFP4BlockScalingRecipeState(RecipeState):
                 return self.recipe.fp4_quant_fwd_weight
             return self.recipe.fp4_quant_fwd_inp
 
+        scale_dtype = (
+            DType.kFloat8UE5M3 if self.recipe.fp8_format == Format.UE5M3 else DType.kFloat8E4M3
+        )
+
         def _make(tensor_type: str) -> NVFP4Quantizer:
             qparams = _qparams(tensor_type)
+
+            # Whether to enable 4over6
             nvfp4_use_4over6 = False
             if tensor_type not in ("grad_output", "grad_input"):
                 if self.recipe.nvfp4_4over6 == "all":
@@ -1681,16 +1771,21 @@ class NVFP4BlockScalingRecipeState(RecipeState):
                     nvfp4_use_4over6 = tensor_type == "weight"
                 elif self.recipe.nvfp4_4over6 == "activations":
                     nvfp4_use_4over6 = tensor_type != "weight"
-            nvfp4_e4m3_max = 448
+
+            # Unsupported configs
             if nvfp4_use_4over6:
-                # Current 4over6 kernels target RL and post-training quantization paths.
-                # Pre-training usage still needs a fused RHT + 4over6 quantization kernel.
                 if qparams.random_hadamard_transform:
                     raise ValueError("NVFP4 4over6 quantization does not support RHT.")
                 if qparams.stochastic_rounding:
                     raise ValueError(
                         "NVFP4 4over6 quantization does not support stochastic rounding."
                     )
+                if scale_dtype == DType.kFloat8UE5M3:
+                    raise ValueError("NVFP4 4over6 quantization is incompatible with UE5M3 scales.")
+
+            # Scale max for 4over6
+            nvfp4_e4m3_max = 0
+            if nvfp4_use_4over6:
                 if self.recipe.nvfp4_4over6_e4m3_use_256 == "all":
                     nvfp4_e4m3_max = 256
                 elif self.recipe.nvfp4_4over6_e4m3_use_256 == "weights":
@@ -1701,8 +1796,10 @@ class NVFP4BlockScalingRecipeState(RecipeState):
                         nvfp4_e4m3_max = 256
                 elif self.recipe.nvfp4_4over6_e4m3_use_256 == "none":
                     nvfp4_e4m3_max = 448
+
             return NVFP4Quantizer(
                 fp4_dtype=self.dtype,
+                scale_dtype=scale_dtype,
                 rowwise=True,
                 columnwise=True,
                 with_rht=qparams.random_hadamard_transform,
@@ -1870,7 +1967,7 @@ class CustomRecipeState(RecipeState):
         self.num_quantizers = num_quantizers
         self.roles = roles
         if device is None:
-            device = torch.device("cuda")
+            device = torch.device(te_device_type())
         self.device = device
 
         # -- Stateful sub-state slots (initialized empty) --
@@ -1894,18 +1991,17 @@ class CustomRecipeState(RecipeState):
             )
             roles = [QuantizerRole() for _ in range(self.num_quantizers)]
 
-        # qfactory must return a Quantizer or QuantizerRequest for every slot.
-        # None is not a valid return value — it would silently disable quantization
-        # for that tensor, risking hard-to-detect performance regressions.
-        # TODO(negvet): Introduce an explicit IdentityQuantizer for intentional no-op
-        # quantization. Until then, None is rejected.
+        # qfactory returns one quantizer-like object per slot; use
+        # ``IdentityQuantizer`` for intentional high-precision passthrough.
         raw = [qfactory(roles[i]) for i in range(self.num_quantizers)]
         for i, q in enumerate(raw):
             if q is None:
                 raise ValueError(
                     f"CustomRecipe qfactory returned None for slot {i} "
                     f"(role={roles[i]}). Every slot must return a Quantizer "
-                    "instance or a QuantizerRequest."
+                    "instance or a QuantizerRequest. For an intentional no-op "
+                    "(high-precision / unquantized) slot, return an "
+                    "IdentityQuantizer instead of None."
                 )
 
         # -- Delayed scaling sub-state --
